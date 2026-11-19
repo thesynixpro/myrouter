@@ -16,13 +16,9 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.isSuccess
 import io.ktor.utils.io.readUTF8Line
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -31,7 +27,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.io.IOException
@@ -263,33 +258,69 @@ class GatewayEngine(
     @Volatile
     private var modelsCache: ModelCache? = null
 
-    /** Enabled providers, in priority order. */
-    fun availableAccounts(): List<ApiAccount> = accounts().filter { it.enabled }.sortedBy { it.priority }
+    /** A fresh snapshot of all persisted providers, read from the store on every call. */
+    private fun allAccounts(): List<ApiAccount> = runCatching { accounts() }.getOrElse { emptyList() }
+
+    private fun enabledAccounts(all: List<ApiAccount>): List<ApiAccount> =
+        all.filter { it.enabled }.sortedBy { it.priority }
+
+    private fun hasCredential(account: ApiAccount): Boolean = account.key.isNotBlank()
+
+    /** Providers that can genuinely serve traffic: enabled and with a decrypted credential. */
+    private fun routableAccounts(all: List<ApiAccount>): List<ApiAccount> =
+        enabledAccounts(all).filter { hasCredential(it) }
+
+    /** Models that can actually be routed, from enabled providers with credentials. */
+    private fun routableModelIds(all: List<ApiAccount>): List<String> =
+        routableAccounts(all)
+            .flatMap { it.models }
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .sorted()
+
+    private fun logProviderDiagnostics(requestId: String, model: String, all: List<ApiAccount>) {
+        val enabled = all.count { it.enabled }
+        val withKey = all.count { it.enabled && hasCredential(it) }
+        val models = all.sumOf { it.models.size }
+        log(
+            "Routing $requestId: requestedModel=$model providersTotal=${all.size} " +
+                "providersEnabled=$enabled providersWithCredential=$withKey configuredModelCount=$models"
+        )
+        all.forEach { a ->
+            val idList = a.models.joinToString(",").ifBlank { "<none>" }
+            log(
+                "Provider[$requestId]: id=${a.id} name=${a.name} enabled=${a.enabled} " +
+                    "hasCredential=${hasCredential(a)} models=$idList baseUrl=${normalizeBaseUrl(a.baseUrl)} format=${a.format}"
+            )
+        }
+    }
 
     /**
-     * Builds a genuine OpenAI model list from configured model IDs and, when the
-     * provider supports it, its upstream GET /models response. Results are cached
-     * briefly so OpenCode's discovery calls stay fast.
+     * Builds an OpenAI-compatible model list containing only models that can
+     * actually be routed right now (enabled provider, decrypted credential present,
+     * and a configured model ID). Never returns a simulated or unroutable model.
      */
     suspend fun listModels(): JsonObject {
-        val providers = availableAccounts().filter { it.key.isNotBlank() }
-        val signature = providers.joinToString("|") { p -> "${p.id}:${p.name}:${p.models.joinToString(",")}:${p.format}" }
+        val all = allAccounts()
+        val routable = routableAccounts(all)
+        val signature = routable.joinToString("|") { p ->
+            "${p.id}:${p.enabled}:${hasCredential(p)}:${p.models.joinToString(",")}:${p.format}:${normalizeBaseUrl(p.baseUrl)}"
+        }
         val now = System.currentTimeMillis()
         val cached = modelsCache
-        if (cached != null && cached.signature == signature && now - cached.at < 60_000L) return cached.value
+        if (cached != null && cached.signature == signature && now - cached.at < 30_000L) return cached.value
+
+        log(
+            "listModels: providersTotal=${all.size} providersEnabled=${all.count { it.enabled }} " +
+                "providersRoutable=${routable.size} routableModels=${routableModelIds(all).size}"
+        )
 
         val owners = LinkedHashMap<String, String>()
-        providers.forEach { provider ->
+        routable.forEach { provider ->
             provider.models.forEach { model ->
-                if (model.isNotBlank()) owners.putIfAbsent(model.trim(), provider.name)
-            }
-        }
-
-        coroutineScope {
-            providers.filter { it.format != ProviderFormat.AZURE }.map { provider ->
-                async { discoverModels(provider) }
-            }.awaitAll().forEach { discovered ->
-                discovered.forEach { (id, owner) -> owners.putIfAbsent(id, owner) }
+                val id = model.trim()
+                if (id.isNotEmpty()) owners.putIfAbsent(id, provider.name)
             }
         }
 
@@ -311,34 +342,6 @@ class GatewayEngine(
         return result
     }
 
-    private suspend fun discoverModels(provider: ApiAccount): List<Pair<String, String>> {
-        val url = buildModelsUrl(provider)
-        if (url.isBlank()) return emptyList()
-        return runCatching {
-            withTimeout(8_000L) {
-                val response = http.request {
-                    url(url)
-                    method = HttpMethod.Get
-                    header(HttpHeaders.Authorization, "Bearer ${provider.key}")
-                    header(HttpHeaders.Accept, ContentType.Application.Json.toString())
-                }
-                if (!response.status.isSuccess()) {
-                    log("Model discovery: ${provider.name} returned HTTP ${response.status.value}")
-                    return@withTimeout emptyList()
-                }
-                val body = parseJsonObject(response.bodyAsText())
-                val array = body?.get("data") as? JsonArray ?: return@withTimeout emptyList()
-                array.mapNotNull { element ->
-                    val id = ((element as? JsonObject)?.get("id") as? JsonPrimitive)?.content?.trim()
-                    if (id.isNullOrEmpty()) null else id to provider.name
-                }
-            }
-        }.getOrElse {
-            log("Model discovery failed for ${provider.name}: ${classifyFailure(it)}")
-            emptyList()
-        }
-    }
-
     /** Handles one chat completion request and delivers the result through [sink]. */
     suspend fun chat(rawBody: String, sink: ChatSink, requestId: String = newRequestId()) {
         val body = parseJsonObject(rawBody)
@@ -357,27 +360,92 @@ class GatewayEngine(
 
         val model = body["model"]!!.jsonPrimitive.content.trim()
         val stream = (body["stream"] as? JsonPrimitive)?.booleanOrNull == true
-        val candidates = availableAccounts().filter { account ->
-            account.key.isNotBlank() && account.models.any { it.trim() == model }
+
+        // Always route from a fresh read of the persistent encrypted store.
+        val all = allAccounts()
+        logProviderDiagnostics(requestId, model, all)
+
+        val enabled = enabledAccounts(all)
+        val providersWithModel = all.filter { account -> account.models.any { it.trim() == model } }
+        val enabledWithModel = providersWithModel.filter { it.enabled }
+        val routableCandidates = routableAccounts(all).filter { account ->
+            account.models.any { it.trim() == model }
         }
-        if (candidates.isEmpty()) {
-            val available = availableAccounts().flatMap { it.models }.map { it.trim() }.distinct().sorted()
-            val message = if (available.isEmpty()) {
-                "No AI provider is configured. Add a provider with an API key and at least one model ID in the app."
-            } else {
-                "Model '$model' is not configured. Available models: ${available.take(25).joinToString(", ")}" +
-                    if (available.size > 25) " (and ${available.size - 25} more)" else ""
+
+        if (routableCandidates.isEmpty()) {
+            val routableModels = routableModelIds(all)
+            val (status, type, code, message) = when {
+                all.isEmpty() -> Quad(
+                    HttpStatusCode.NotFound,
+                    "invalid_request_error",
+                    "no_providers_configured",
+                    "No AI providers are configured in persistent storage. Add an enabled provider with an API key and at least one model ID in the app."
+                )
+                enabled.isEmpty() -> Quad(
+                    HttpStatusCode.NotFound,
+                    "invalid_request_error",
+                    "providers_disabled",
+                    "All configured AI providers are disabled (${all.size} provider(s) stored). Enable a provider that includes model '$model'."
+                )
+                providersWithModel.isEmpty() -> {
+                    val suffix = if (routableModels.isEmpty()) {
+                        " No models can currently be routed."
+                    } else {
+                        " Routable models: ${routableModels.take(25).joinToString(", ")}" +
+                            if (routableModels.size > 25) " (and ${routableModels.size - 25} more)" else ""
+                    }
+                    Quad(
+                        HttpStatusCode.NotFound,
+                        "invalid_request_error",
+                        "model_not_found",
+                        "Model '$model' is not configured on any provider.$suffix"
+                    )
+                }
+                enabledWithModel.isEmpty() -> Quad(
+                    HttpStatusCode.NotFound,
+                    "invalid_request_error",
+                    "provider_disabled",
+                    "Model '$model' is configured, but every provider that defines it is disabled."
+                )
+                enabledWithModel.none { hasCredential(it) } -> Quad(
+                    HttpStatusCode.BadGateway,
+                    "server_error",
+                    "missing_credentials",
+                    "Model '$model' is configured and enabled, but the provider credential is missing or could not be decrypted from secure storage."
+                )
+                else -> {
+                    val suffix = if (routableModels.isEmpty()) "" else " Routable models: ${routableModels.joinToString(", ")}"
+                    Quad(
+                        HttpStatusCode.NotFound,
+                        "invalid_request_error",
+                        "model_not_found",
+                        "Model '$model' cannot be routed by the current provider configuration.$suffix"
+                    )
+                }
             }
-            sink.json(HttpStatusCode.NotFound, openAiError(message, "invalid_request_error", "model_not_found"))
+            log(
+                "Routing $requestId failed: model=$model result=no_routable_candidate code=$code " +
+                    "providersTotal=${all.size} providersEnabled=${enabled.size} " +
+                    "providersWithModel=${providersWithModel.size} enabledWithModel=${enabledWithModel.size}"
+            )
+            sink.json(status, openAiError(message, type, code))
             return
         }
+
+        log(
+            "Routing $requestId: model=$model stream=$stream selectedCandidates=${routableCandidates.size} " +
+                "candidateProviders=${routableCandidates.joinToString { it.id }}"
+        )
 
         val maxRetries = config().maxRetries.coerceIn(0, 5)
         var lastStatus = HttpStatusCode.BadGateway
         var lastMessage = "All configured providers failed."
-        log("Chat request $requestId model=$model stream=$stream providers=${candidates.size}")
 
-        for (account in candidates) {
+        for (account in routableCandidates) {
+            log(
+                "Routing $requestId: attempting provider=${account.name} id=${account.id} " +
+                    "baseUrl=${normalizeBaseUrl(account.baseUrl)} format=${account.format}"
+            )
             val url = buildChatUrl(account, model)
             val payload = buildUpstreamBody(body, account, model).toString()
 
@@ -395,6 +463,7 @@ class GatewayEngine(
                                 return
                             }
                             outcome.streamText != null -> {
+                                log("Completed(stream-coerced) $requestId via ${account.name}")
                                 sink.stream(
                                     HttpStatusCode.OK,
                                     flow {
@@ -432,6 +501,8 @@ class GatewayEngine(
 
         sink.json(lastStatus, openAiError(lastMessage, errorType(lastStatus), "upstream_failure"))
     }
+
+    private data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
     private fun buildUpstreamBody(original: JsonObject, account: ApiAccount, model: String): JsonObject {
         val compatDrop = setOf("stream_options", "logprobs", "top_logprobs", "service_tier")

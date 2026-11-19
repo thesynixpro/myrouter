@@ -68,7 +68,12 @@ class GatewayService : Service() {
     override fun onCreate() {
         super.onCreate()
         HubSettings.init(applicationContext)
+        // Install the same encrypted store the APIs screen uses and verify it
+        // before the listener can accept any request. This also covers a service
+        // restarted by Android before the Activity has been recreated.
+        ProviderRepository.install(HubSettings)
         GatewayController.init(applicationContext)
+        logProviderState("service onCreate")
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, notificationFor(GatewayController.status.value))
         notificationJob = scope.launch {
@@ -90,6 +95,9 @@ class GatewayService : Service() {
                     stopSelf()
                     return START_NOT_STICKY
                 }
+                // Provider data may have been added or edited while we were stopped
+                // or after a process recreation; always re-read from the store.
+                logProviderState("service start/restart")
                 startGateway()
             }
         }
@@ -127,11 +135,12 @@ class GatewayService : Service() {
                 }
                 httpClient = client
                 val engine = GatewayEngine(
-                    accounts = { HubSettings.loadAccounts() },
+                    accounts = { ProviderRepository.load() },
                     config = { HubSettings.config() },
                     http = client,
                     log = { GatewayLog.add(it) }
                 )
+                logProviderState("gateway started")
 
                 val listener = embeddedServer(CIO, port = settings.port, host = "0.0.0.0") {
                     routing {
@@ -152,9 +161,10 @@ class GatewayService : Service() {
                             }
                             GatewayController.noteRequest()
                             val started = System.currentTimeMillis()
+                            logProviderState("GET /v1/models")
                             val body = engine.listModels()
                             val count = (body["data"] as? JsonArray)?.size ?: 0
-                            GatewayLog.add("GET /v1/models -> 200 ($count models, ${System.currentTimeMillis() - started}ms)")
+                            GatewayLog.add("GET /v1/models -> 200 routableModels=$count (${System.currentTimeMillis() - started}ms)")
                             call.respondText(body.toString(), ContentType.Application.Json, HttpStatusCode.OK)
                         }
 
@@ -165,6 +175,8 @@ class GatewayService : Service() {
                             }
                             GatewayController.noteRequest()
                             val raw = runCatching { call.receiveText() }.getOrDefault("")
+                            val requestedModel = (parseJsonObject(raw)?.get("model") as? kotlinx.serialization.json.JsonPrimitive)?.content
+                            logProviderState("POST /v1/chat/completions model=${requestedModel ?: "<missing>"}")
                             engine.chat(raw, ServerChatSink(call))
                         }
 
@@ -311,6 +323,16 @@ class GatewayService : Service() {
         runCatching {
             getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notificationFor(status))
         }
+    }
+
+    /**
+     * Diagnostic snapshot of the persistent provider store. Logs counts and
+     * provider/model IDs only; never logs API keys or credential material.
+     */
+    private fun logProviderState(context: String) {
+        val summary = runCatching { ProviderRepository.diagnosticSummary() }
+            .getOrElse { "diagnostics unavailable: ${it::class.simpleName}" }
+        GatewayLog.add("Provider state [$context]: $summary")
     }
 
     override fun onDestroy() {

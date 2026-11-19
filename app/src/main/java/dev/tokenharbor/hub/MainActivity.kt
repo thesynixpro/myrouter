@@ -66,12 +66,23 @@ class HubViewModel : ViewModel() {
 
     init {
         val config = HubSettings.config()
+        ProviderRepository.install(HubSettings)
         _state.value = _state.value.copy(
-            accounts = HubSettings.loadAccounts(),
+            accounts = ProviderRepository.refresh(),
             port = config.port.toString(),
             masterKey = config.masterKey,
             model = config.defaultModel
         )
+
+        // The repository is the single source of truth; keep the UI in sync
+        // with whatever the gateway service loaded from persistent storage.
+        viewModelScope.launch {
+            ProviderRepository.providers.collect { list ->
+                if (_state.value.accounts != list) {
+                    _state.value = _state.value.copy(accounts = list)
+                }
+            }
+        }
 
         viewModelScope.launch {
             GatewayController.status.collect { status ->
@@ -122,14 +133,14 @@ class HubViewModel : ViewModel() {
         )
         val next = _state.value.accounts + account
         _state.value = _state.value.copy(accounts = next)
-        HubSettings.saveAccounts(next)
+        ProviderRepository.save(next)
         GatewayLog.add("Added provider '${account.name}' with ${modelIds.size} model ID(s), format=${format.name}")
     }
 
     fun remove(index: Int) {
         val next = _state.value.accounts.filterIndexed { i, _ -> i != index }
         _state.value = _state.value.copy(accounts = next)
-        HubSettings.saveAccounts(next)
+        ProviderRepository.save(next)
         GatewayLog.add("Removed provider #${index + 1}")
     }
 
@@ -138,7 +149,7 @@ class HubViewModel : ViewModel() {
             if (i == index) account.copy(enabled = enabled) else account
         }
         _state.value = _state.value.copy(accounts = next)
-        HubSettings.saveAccounts(next)
+        ProviderRepository.save(next)
         GatewayLog.add("Provider '${next[index].name}' ${if (enabled) "enabled" else "disabled"}")
     }
 
@@ -174,6 +185,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         HubSettings.init(applicationContext)
+        ProviderRepository.install(HubSettings)
         GatewayController.init(applicationContext)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&

@@ -93,11 +93,11 @@ class GatewayEngineIntegrationTest {
                     log = { }
                 )
 
-                // 1. Models are built from configured IDs plus the upstream /models response.
+                // 1. Models list contains only routable configured models (never simulated/unroutable).
                 val models = engine.listModels().toString()
-                assertTrue(models.contains("test-model"))
-                assertTrue(models.contains("upstream-model"))
                 assertTrue(models.contains("\"object\":\"list\""))
+                assertTrue(models.contains("test-model"))
+                assertFalse("Unconfigured upstream-only models must not be listed as routable", models.contains("upstream-model"))
 
                 // 2. Non-streaming, OpenCode-shaped request with tools is forwarded unchanged.
                 var jsonStatus: HttpStatusCode? = null
@@ -141,7 +141,8 @@ class GatewayEngineIntegrationTest {
                 assertTrue(frames.any { it.contains("\"content\":\"llo\"") })
                 assertEquals("data: [DONE]\n\n", frames.last())
 
-                // 4. Invalid model never reaches an upstream provider.
+                // 4. Invalid model never reaches an upstream provider and must not
+                // be misreported as "no provider configured" when a valid provider exists.
                 var invalidStatus: HttpStatusCode? = null
                 var invalidBody = ""
                 engine.chat("""{"model":"does-not-exist","messages":[{"role":"user","content":"hi"}]}""",
@@ -154,6 +155,9 @@ class GatewayEngineIntegrationTest {
                     })
                 assertEquals(HttpStatusCode.NotFound, invalidStatus)
                 assertTrue(invalidBody.contains("model_not_found"))
+                assertFalse(
+                    invalidBody.contains("No AI provider is configured. Add a provider with an API key and at least one model ID in the app.")
+                )
 
                 // 5. Malformed JSON is rejected with a 400.
                 var badStatus: HttpStatusCode? = null

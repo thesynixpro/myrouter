@@ -20,7 +20,7 @@ import java.util.UUID
  * Provider metadata is stored as JSON; API keys live in separate encrypted
  * entries so they are never written to the metadata blob.
  */
-object HubSettings {
+object HubSettings : ProviderStore {
     private const val PREFS_NAME = "token_harbor_secure_prefs"
     private const val KEY_PROVIDERS = "providers_json"
     private const val KEY_PORT = "gateway_port"
@@ -95,6 +95,16 @@ object HubSettings {
 
     fun desiredRunning(): Boolean = store().getBoolean(KEY_RUNNING, false)
 
+    /** True when a decrypted upstream credential is present. Never exposes the value. */
+    override fun hasKey(accountId: String): Boolean = runCatching {
+        val value = store().getString(KEY_PREFIX + accountId, null)
+        !value.isNullOrBlank()
+    }.getOrDefault(false)
+
+    override fun load(): List<ApiAccount> = loadAccounts()
+
+    override fun save(accounts: List<ApiAccount>) = saveAccounts(accounts)
+
     fun loadAccounts(): List<ApiAccount> {
         val p = store()
         val raw = p.getString(KEY_PROVIDERS, null) ?: return emptyList()
@@ -103,9 +113,19 @@ object HubSettings {
             val obj = element as? JsonObject ?: return@mapNotNull null
             fun text(key: String) = (obj[key] as? JsonPrimitive)?.content.orEmpty()
             val id = text("id").ifBlank { UUID.randomUUID().toString() }
+            // Decrypt the credential from the Keystore-backed store. A per-provider
+            // failure must not hide other providers, and the value is never logged.
+            val decryptedKey = runCatching { p.getString(KEY_PREFIX + id, null) }
+                .onFailure { error ->
+                    GatewayLog.add(
+                        "Credential read failed for provider id=$id: " +
+                            "${error::class.simpleName} (stored key may be unavailable)"
+                    )
+                }
+                .getOrNull()
             ApiAccount(
                 name = text("name").ifBlank { "Provider" },
-                key = p.getString(KEY_PREFIX + id, null) ?: text("legacyKey"),
+                key = decryptedKey ?: text("legacyKey"),
                 baseUrl = text("baseUrl").ifBlank { "https://tokenharbor.ai/v1" },
                 enabled = (obj["enabled"] as? JsonPrimitive)?.booleanOrNull ?: true,
                 id = id,
