@@ -1,8 +1,10 @@
-name: Build APK and publish latest release
+
+name: Build APK and Publish Latest Release
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -14,45 +16,75 @@ concurrency:
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
 
-      - name: Accept Android licenses
-        run: yes | sdkmanager --licenses || true
+      - name: Accept Android SDK Licenses
+        shell: bash
+        run: |
+          set +e
+          yes | sdkmanager --licenses
+          exit 0
 
-      - name: Set up Gradle
+      - name: Install Android SDK Packages
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: '8.9'
 
-      - name: Generate Gradle wrapper
+      - name: Generate Gradle Wrapper
         run: gradle wrapper --gradle-version 8.9
 
-      - name: Build debug APK
-        run: ./gradlew --no-daemon assembleDebug
+      - name: Build Debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon clean assembleDebug
 
-      - name: Upload APK artifact
+      - name: Verify APK
+        run: |
+          test -f app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TokenHarborHub-debug
+          name: TokenHarborHub-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
-      - name: Publish latest GitHub Release
+      - name: Publish Latest GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="v${GITHUB_RUN_NUMBER}"
-          gh release create "$VERSION" app/build/outputs/apk/debug/app-debug.apk             --repo "$GITHUB_REPOSITORY"             --title "Token Harbor Hub - Latest APK"             --notes "Automatically built from commit ${GITHUB_SHA}."             --latest
+          VERSION="v1.0.${GITHUB_RUN_NUMBER}"
+
+          gh release create "$VERSION" \
+            app/build/outputs/apk/debug/app-debug.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Token Harbor Hub Latest APK" \
+            --notes "Automated Android APK build.
+
+          Commit: ${GITHUB_SHA}
+          Build: ${GITHUB_RUN_NUMBER}" \
+            --latest
