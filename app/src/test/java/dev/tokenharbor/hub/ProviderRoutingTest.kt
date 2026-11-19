@@ -83,9 +83,10 @@ class ProviderRoutingTest {
         val upstream = embeddedServer(CIO, port = 0, host = "127.0.0.1") {
             routing {
                 post("/v1/chat/completions") {
-                    upstreamBody.set(call.receiveText())
+                    val text = call.receiveText()
+                    upstreamBody.set(text)
                     upstreamAuth.set(call.request.header(HttpHeaders.Authorization).orEmpty())
-                    val req = parseJsonObject(call.receiveText()) ?: JsonObject(emptyMap())
+                    val req = parseJsonObject(text) ?: JsonObject(emptyMap())
                     if ((req["stream"] as? JsonPrimitive)?.booleanOrNull == true) {
                         call.respondBytesWriter(contentType = ContentType("text", "event-stream")) {
                             writeStringUtf8("data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
