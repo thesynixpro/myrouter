@@ -32,16 +32,15 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          accept-android-sdk-licenses: true
+          accept-android-sdk-licenses: false
+          cmdline-tools-version: 12266719
 
       - name: Accept Android SDK Licenses
         shell: bash
         run: |
-          set +e
           yes | sdkmanager --licenses
-          exit 0
 
-      - name: Install Android SDK Packages
+      - name: Install Required SDK Packages
         run: |
           sdkmanager --install \
             "platform-tools" \
@@ -73,7 +72,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish Latest GitHub Release
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
