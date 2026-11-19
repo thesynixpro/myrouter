@@ -1,0 +1,58 @@
+name: Build APK and publish latest release
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: token-harbor-hub-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Generate Gradle wrapper
+        run: gradle wrapper --gradle-version 8.9
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TokenHarborHub-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish latest GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="v${GITHUB_RUN_NUMBER}"
+          gh release create "$VERSION" app/build/outputs/apk/debug/app-debug.apk             --repo "$GITHUB_REPOSITORY"             --title "Token Harbor Hub - Latest APK"             --notes "Automatically built from commit ${GITHUB_SHA}."             --latest
