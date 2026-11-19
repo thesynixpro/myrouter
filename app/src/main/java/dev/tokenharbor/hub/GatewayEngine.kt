@@ -452,8 +452,9 @@ class GatewayEngine(
         payload: String,
         stream: Boolean,
         requestId: String
-    ): Outcome = try {
-        val settings = config()
+    ): Outcome {
+        return try {
+            val settings = config()
         val response = http.request {
             url(url)
             method = HttpMethod.Post
@@ -503,7 +504,8 @@ class GatewayEngine(
         throw error
     } catch (error: Throwable) {
         val message = classifyFailure(error)
-        Outcome.Failure(message, retryable = true, timeout = message.contains("timed out", ignoreCase = true))
+            Outcome.Failure(message, retryable = true, timeout = message.contains("timed out", ignoreCase = true))
+        }
     }
 
     private fun sseFrames(response: HttpResponse, account: ApiAccount, requestId: String): Flow<String> = flow {
