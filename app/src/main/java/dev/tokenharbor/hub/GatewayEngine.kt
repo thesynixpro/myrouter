@@ -78,10 +78,11 @@ fun buildChatUrl(account: ApiAccount, model: String): String {
     val base = normalizeBaseUrl(account.baseUrl)
     return when (account.format) {
         ProviderFormat.AZURE -> {
-            val root = if (base.endsWith("/openai", ignoreCase = true)) {
-                base.dropLast("/openai".length)
-            } else {
-                base
+            // Azure endpoints live at /openai/deployments/... off the resource root,
+            // so drop OpenAI-style /v1 and /openai suffixes from a configured base URL.
+            var root = base
+            listOf("/openai", "/v1").forEach { suffix ->
+                if (root.endsWith(suffix, ignoreCase = true)) root = root.dropLast(suffix.length)
             }
             val version = account.apiVersion.ifBlank { "2024-02-15-preview" }
             val deployment = URLEncoder.encode(model, "UTF-8")
