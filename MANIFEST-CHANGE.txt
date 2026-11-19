@@ -1,6 +1,0 @@
-In app/src/main/AndroidManifest.xml, add these attributes inside the existing <application ...> tag:
-
-android:icon="@mipmap/ic_launcher"
-android:roundIcon="@mipmap/ic_launcher_round"
-
-Do not add a second <application> tag. Keep the existing application attributes.
