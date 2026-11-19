@@ -49,10 +49,15 @@ jobs:
       - name: Generate Gradle Wrapper
         run: gradle wrapper --gradle-version 8.9
 
+      - name: Run Unit Tests
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest
+
       - name: Build Debug APK
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon clean assembleDebug
+          ./gradlew --no-daemon assembleDebug
 
       - name: Verify APK
         run: |

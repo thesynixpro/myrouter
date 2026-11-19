@@ -92,11 +92,18 @@ object GatewayController {
 
     /** LAN address of the active Wi-Fi/Ethernet interface, without needing location permission. */
     fun detectLanIp(): String {
-        val interfaces = runCatching { NetworkInterface.getNetworkInterfaces()?.toList() }
-            .getOrDefault(emptyList())
+        val interfaces = runCatching {
+            NetworkInterface.getNetworkInterfaces()
+                ?.let { java.util.Collections.list(it) }
+                .orEmpty()
+        }.getOrElse { emptyList() }
         val candidates = interfaces
             .filter { it.isUp && !it.isLoopback && !it.isVirtual }
-            .flatMap { ni -> ni.inetAddresses.toList().filterIsInstance<Inet4Address>().map { ni.name to it.hostAddress } }
+            .flatMap { ni ->
+                java.util.Collections.list(ni.inetAddresses)
+                    .filterIsInstance<Inet4Address>()
+                    .map { ni.name to it.hostAddress }
+            }
             .filter { (_, address) -> !address.isNullOrBlank() && !address.startsWith("169.254.") }
         return candidates.firstOrNull { (name, _) -> name.contains("wlan", ignoreCase = true) }?.second
             ?: candidates.firstOrNull { (name, _) -> name.contains("eth", ignoreCase = true) }?.second
