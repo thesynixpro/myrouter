@@ -17,6 +17,8 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import io.ktor.utils.io.writeStringUtf8
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
@@ -195,6 +197,88 @@ class GatewayEngineIntegrationTest {
                 assertEquals(HttpStatusCode.BadGateway, failureStatus)
                 assertTrue(failureBody.contains("offline"))
                 assertFalse(failureBody.contains("\"choices\""))
+            } finally {
+                client.close()
+            }
+        } finally {
+            upstream.stop(500L, 2_000L)
+        }
+    }
+
+    /**
+     * Regression test for the OpenCode "the model did not respond for too long
+     * (timeout)" report: a streaming request must start producing bytes before
+     * the upstream provider answers, and must keep heartbeating while the
+     * provider is silent.
+     */
+    @Test
+    fun streamingStartsImmediatelyAndHeartbeatsWhileUpstreamIsSlow() = runBlocking {
+        val upstream = embeddedServer(CIO, port = 0, host = "127.0.0.1") {
+            routing {
+                post("/v1/chat/completions") {
+                    call.receiveText()
+                    // Accept the request, then take a long time before the first
+                    // token (a "thinking" free model).
+                    delay(3_000L)
+                    call.respondBytesWriter(contentType = ContentType("text", "event-stream")) {
+                        writeStringUtf8("data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":\"stop\"}]}\n\n")
+                        flush()
+                        writeStringUtf8("data: [DONE]\n\n")
+                        flush()
+                    }
+                }
+            }
+        }.start(wait = false)
+
+        try {
+            val port = upstream.engine.resolvedConnectors().first().port
+            val client = HttpClient(OkHttp)
+            try {
+                val engine = GatewayEngine(
+                    accounts = {
+                        listOf(
+                            ApiAccount(
+                                name = "slow",
+                                key = "k",
+                                baseUrl = "http://127.0.0.1:$port/v1",
+                                models = listOf("slow-model")
+                            )
+                        )
+                    },
+                    config = { GatewayConfig(maxRetries = 0, streamKeepAliveMs = 100L) },
+                    http = client
+                )
+
+                val events = mutableListOf<Pair<Long, String>>()
+                val started = System.currentTimeMillis()
+                val sink = object : ChatSink {
+                    override suspend fun json(status: HttpStatusCode, body: JsonObject) {
+                        throw AssertionError("Expected SSE response, got JSON: $body")
+                    }
+
+                    override suspend fun stream(status: HttpStatusCode, frames: Flow<String>, requestId: String) {
+                        assertEquals(HttpStatusCode.OK, status)
+                        frames.collect { events.add((System.currentTimeMillis() - started) to it) }
+                    }
+                }
+
+                engine.chat(
+                    """{"model":"slow-model","messages":[{"role":"user","content":"hi"}],"stream":true}""",
+                    sink
+                )
+
+                assertTrue("no SSE frames were produced", events.isNotEmpty())
+                assertTrue(
+                    "streaming must open before the slow upstream responds",
+                    events.first().first < 2_000L
+                )
+                assertTrue(events.first().second.contains("tokenharbor-stream-open"))
+                assertTrue(
+                    "expected heartbeat frames while the upstream was silent",
+                    events.any { it.second.contains("keep-alive") }
+                )
+                assertTrue(events.any { it.second.contains("\"content\":\"late\"") })
+                assertEquals("data: [DONE]\n\n", events.last().second)
             } finally {
                 client.close()
             }

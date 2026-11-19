@@ -16,9 +16,14 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.isSuccess
 import io.ktor.utils.io.readUTF8Line
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -33,6 +38,14 @@ import java.io.IOException
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.UUID
+
+/**
+ * How often an idle streaming response emits an SSE comment while the upstream
+ * provider is being contacted or is "thinking". OpenAI-compatible clients
+ * (including OpenCode) treat a silent connection as a timeout, so the gateway
+ * must send bytes before the first upstream token arrives.
+ */
+private const val STREAM_KEEP_ALIVE_MS = 5_000L
 
 /** How a request is shaped when it is forwarded to the upstream provider. */
 enum class ProviderFormat {
@@ -53,7 +66,9 @@ data class GatewayConfig(
     val defaultModel: String = "",
     val connectTimeoutMs: Long = 10_000L,
     val socketTimeoutMs: Long = 120_000L,
-    val maxRetries: Int = 2
+    val maxRetries: Int = 2,
+    /** Idle interval between SSE heartbeat comments while a stream waits upstream. */
+    val streamKeepAliveMs: Long = STREAM_KEEP_ALIVE_MS
 )
 
 /**
@@ -437,6 +452,20 @@ class GatewayEngine(
                 "candidateProviders=${routableCandidates.joinToString { it.id }}"
         )
 
+        if (stream) {
+            // Open the SSE response right away instead of waiting for the upstream
+            // response headers or first token. A slow provider used to leave the
+            // client with a completely silent connection, which it reports as
+            // "the model did not respond for too long (timeout)".
+            log("Streaming $requestId: opening SSE immediately for model=$model")
+            sink.stream(
+                HttpStatusCode.OK,
+                streamingFrames(body, model, routableCandidates, requestId),
+                requestId
+            )
+            return
+        }
+
         val maxRetries = config().maxRetries.coerceIn(0, 5)
         var lastStatus = HttpStatusCode.BadGateway
         var lastMessage = "All configured providers failed."
@@ -500,6 +529,129 @@ class GatewayEngine(
         }
 
         sink.json(lastStatus, openAiError(lastMessage, errorType(lastStatus), "upstream_failure"))
+    }
+
+    /**
+     * Builds the SSE frame flow for a streaming request.
+     *
+     * The first comment is emitted before the upstream is contacted, and a
+     * heartbeat comment is emitted every [STREAM_KEEP_ALIVE_MS] while the
+     * gateway waits for upstream headers or the model's first token. Both are
+     * valid SSE comment lines: clients ignore their content but keep the
+     * connection open instead of aborting with a timeout.
+     */
+    private fun streamingFrames(
+        original: JsonObject,
+        model: String,
+        candidates: List<ApiAccount>,
+        requestId: String
+    ): Flow<String> = flow {
+        emit(": tokenharbor-stream-open\n\n")
+        val keepAliveMs = config().streamKeepAliveMs.coerceAtLeast(50L)
+        coroutineScope {
+            val frames = Channel<String>(Channel.BUFFERED)
+            val keepAlive = launch {
+                try {
+                    while (isActive) {
+                        delay(keepAliveMs)
+                        frames.send(": keep-alive\n\n")
+                    }
+                } catch (_: Throwable) {
+                    // Response completed or client disconnected; stop heartbeating.
+                }
+            }
+            val producer = launch {
+                try {
+                    forwardStream(original, model, candidates, requestId) { frame ->
+                        frames.send(frame)
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    val message = classifyFailure(error)
+                    log("Stream setup failed $requestId: $message")
+                    runCatching {
+                        frames.send(
+                            "data: ${openAiError("Upstream stream failed: $message", "server_error", "stream_error")}\n\n"
+                        )
+                        frames.send("data: [DONE]\n\n")
+                    }
+                } finally {
+                    frames.close()
+                }
+            }
+            try {
+                while (true) {
+                    val next = frames.receiveCatching()
+                    val frame = next.getOrNull() ?: break
+                    emit(frame)
+                }
+            } finally {
+                keepAlive.cancel()
+                producer.cancel()
+            }
+        }
+    }
+
+    /**
+     * Performs the upstream request for a streaming chat completion and forwards
+     * real SSE frames to [send]. Provider failover and retries behave exactly
+     * like the non-streaming path; failures become an OpenAI error SSE frame.
+     */
+    private suspend fun forwardStream(
+        original: JsonObject,
+        model: String,
+        candidates: List<ApiAccount>,
+        requestId: String,
+        send: suspend (String) -> Unit
+    ) {
+        val maxRetries = config().maxRetries.coerceIn(0, 5)
+        var lastStatus = HttpStatusCode.BadGateway
+        var lastMessage = "All configured providers failed."
+
+        for (account in candidates) {
+            val url = buildChatUrl(account, model)
+            val payload = buildUpstreamBody(original, account, model).toString()
+            log(
+                "Streaming $requestId: attempting provider=${account.name} id=${account.id} " +
+                    "baseUrl=${normalizeBaseUrl(account.baseUrl)} format=${account.format}"
+            )
+
+            for (attempt in 0..maxRetries) {
+                when (val outcome = requestOnce(account, url, payload, stream = true, requestId = requestId)) {
+                    is Outcome.Ready -> {
+                        val response = outcome.streamResponse
+                        if (response != null) {
+                            sseFrames(response, account, requestId).collect { frame -> send(frame) }
+                            return
+                        }
+                        val text = outcome.streamText ?: outcome.json?.toString()
+                        if (text != null) {
+                            send("data: $text\n\n")
+                            send("data: [DONE]\n\n")
+                            return
+                        }
+                    }
+                    is Outcome.HttpError -> {
+                        lastStatus = mapUpstreamStatus(outcome.status)
+                        lastMessage = describeUpstreamError(account, outcome.status, outcome.body)
+                        log("$requestId ${account.name}: HTTP ${outcome.status.value} (attempt ${attempt + 1}) - ${redact(lastMessage)}")
+                        if (!retryableStatus(outcome.status) || attempt == maxRetries) break
+                        delay(250L * (attempt + 1))
+                    }
+                    is Outcome.Failure -> {
+                        lastStatus = if (outcome.timeout) HttpStatusCode.GatewayTimeout else HttpStatusCode.BadGateway
+                        lastMessage = "Provider '${account.name}' (${hostOf(account.baseUrl)}): ${outcome.message}"
+                        log("$requestId failed on ${account.name}: ${outcome.message} (attempt ${attempt + 1})")
+                        if (!outcome.retryable || attempt == maxRetries) break
+                        delay(250L * (attempt + 1))
+                    }
+                }
+            }
+        }
+
+        send("data: ${openAiError(lastMessage, errorType(lastStatus), "upstream_failure")}\n\n")
+        send("data: [DONE]\n\n")
     }
 
     private data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
@@ -576,9 +728,13 @@ class GatewayEngine(
         throw error
     } catch (error: Throwable) {
         val message = classifyFailure(error)
-            Outcome.Failure(message, retryable = true, timeout = message.contains("timed out", ignoreCase = true))
-        }
+        val timedOut = message.contains("timed out", ignoreCase = true)
+        // A timeout already consumed the full socket budget, so retrying the
+        // same provider only makes the caller wait longer. Fail over to the
+        // next provider instead.
+        Outcome.Failure(message, retryable = !timedOut, timeout = timedOut)
     }
+}
 
     private fun sseFrames(response: HttpResponse, account: ApiAccount, requestId: String): Flow<String> = flow {
         val channel = response.bodyAsChannel()
