@@ -43,12 +43,12 @@ class GatewayHelpersTest {
         }
         assertEquals(null, validateChatRequest(valid))
 
-        val noModel = buildJsonObject { put("messages", buildJsonArray()) }
+        val noModel = buildJsonObject { put("messages", buildJsonArray { }) }
         assertTrue(validateChatRequest(noModel)!!.contains("model"))
 
         val emptyMessages = buildJsonObject {
             put("model", "m")
-            put("messages", buildJsonArray())
+            put("messages", buildJsonArray { })
         }
         assertTrue(validateChatRequest(emptyMessages)!!.contains("messages"))
 
