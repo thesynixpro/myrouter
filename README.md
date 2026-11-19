@@ -1,34 +1,64 @@
 # Token Harbor Hub (Android)
 
-Native Kotlin + Jetpack Compose starter for a personal Token Harbor API gateway.
+A real, on-device OpenAI-compatible API gateway for OpenCode, built with Kotlin,
+Jetpack Compose and Ktor. It forwards requests to configured upstream AI
+providers and returns their genuine responses; it does not simulate models or
+completions.
 
-## Important status
+## What is implemented
 
-This is an **initial project scaffold**, not yet a finished/production-ready gateway. The Android UI and GitHub Actions release workflow are included. The real Ktor listener, upstream proxy/failover, encrypted credential persistence, and SSE streaming still need implementation and device testing. The Start/Stop control is currently a UI scaffold and does not yet start the listener.
+- Genuine Ktor/CIO HTTP server bound to `0.0.0.0` in a foreground service.
+- `GET /v1/models` and `POST /v1/chat/completions`.
+- Bearer-token authentication with a configurable master API key.
+- Non-streaming JSON and streaming SSE (`text/event-stream`) responses.
+- Provider management: base URL, API key, model IDs, request format
+  (`OPENAI`, `OPENAI_COMPAT`, `AZURE`) and Azure api-version.
+- Credentials encrypted with Android Keystore-backed `EncryptedSharedPreferences`.
+- Priority routing, retries with backoff, failover on 429/408/5xx/connect
+  failures/timeouts, and no retries after streaming bytes are sent.
+- Request validation, OpenAI-shaped error responses, redacted activity logs,
+  request IDs, and useful upstream failure diagnostics.
+- LAN reachability: the app displays the device Wi-Fi IP, port and exact URLs.
+- Foreground-service notification with Start/Stop actions, START_STICKY restart,
+  battery-optimization exemption prompt, and full lifecycle cleanup.
 
-Do not enter real API keys in this build.
+## Connect OpenCode
 
-## Token Harbor values
+1. Add a provider on the **APIs** tab: API base URL (for example
+   `https://tokenharbor.ai/v1`), upstream API key, and the model IDs to expose.
+2. On the **Server** tab set a strong master API key and port (default `8080`),
+   then tap **Start Server**.
+3. On the same Wi-Fi, configure OpenCode's OpenAI-compatible custom provider:
+   - `apiBaseURL`: `http://<LAN_IP_SHOWN_IN_APP>:8080/v1`
+   - `apiKey`: the master API key from the app
+   - model ID: one of the model IDs configured on the APIs tab
 
-- Upstream Base URL: `https://tokenharbor.ai/v1`
-- Example model: `deepseek-v4.1-flash:free`
-- Token Harbor API keys are upstream credentials; the eventual app should keep them encrypted and never expose them to OpenCode.
+On the device itself the base URL is `http://127.0.0.1:8080/v1`.
+`GET /health` is an unauthenticated diagnostic endpoint.
 
-The app's future local endpoint is intended to be `http://127.0.0.1:8080/v1`. This is only a displayed target until the gateway server is implemented.
+Example requests:
+
+```bash
+curl -H "Authorization: Bearer YOUR_MASTER_KEY" \
+  http://<LAN_IP>:8080/v1/models
+
+curl -H "Authorization: Bearer YOUR_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash:free","messages":[{"role":"user","content":"Hello"}]}' \
+  http://<LAN_IP>:8080/v1/chat/completions
+```
 
 ## Build
 
-Open this project in Android Studio, or run `gradle wrapper --gradle-version 8.9` and then `./gradlew assembleDebug`.
+```bash
+./gradlew testDebugUnitTest assembleDebug
+```
 
-## GitHub Actions
+GitHub Actions (`Build APK and Publish Latest Release`) builds the debug APK on
+every push to `main` and publishes the latest release.
 
-Push to `main` or manually run **Build APK and publish latest release** in Actions. The workflow generates the Gradle wrapper, builds the debug APK, uploads it as an Actions artifact, and publishes a numbered GitHub Release marked as latest.
+## Notes
 
-## Planned gateway behavior
-
-- OpenAI-compatible `/v1/models` and `/v1/chat/completions`
-- Master-key authentication for the local gateway
-- Priority routing and 429 / transient 5xx failover
-- Cooldown tracking
-- SSE streaming, with no retry after output bytes have started
-- Encrypted provider-key storage
+Android may still limit background execution under memory pressure. Use the
+**Ignore battery optimizations** button on the Settings tab and keep the
+foreground notification enabled for best reliability.
